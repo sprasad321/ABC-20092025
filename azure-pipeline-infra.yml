@@ -1,0 +1,120 @@
+trigger: none
+
+pool:
+  vmImage: 'slinux'
+
+variables:
+  resourceGroupName: 'spk'
+  containerRegistryName: 'sowspk2containerregistry$(Build.BuildId)'
+  location: 'eastus'
+  imageName: 'myapp'
+
+stages:
+- stage: Infrastructure
+  displayName: 'Create Infrastructure'
+  jobs:
+  - job: CreateACR
+    displayName: 'Create Container Registry'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Create Resource Group and ACR'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Create resource group
+          az group create --name $(resourceGroupName) --location $(location)
+          
+          # Create container registry
+          az acr create --resource-group $(resourceGroupName) \
+            --name $(containerRegistryName) \
+            --sku Basic \
+            --admin-enabled true
+
+- stage: BuildAndDeploy
+  displayName: 'Build and Deploy Containers'
+  dependsOn: Infrastructure
+  jobs:
+  - job: BuildImages
+    displayName: 'Build Docker Images'
+    steps:
+    - task: Docker@2
+      displayName: 'Build Create Image'
+      inputs:
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        buildContext: '.'
+        repository: '$(imageName)'
+        tags: 'create'
+        arguments: '--target create'
+    
+    - task: Docker@2
+      displayName: 'Build Cleanup Image'
+      inputs:
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        buildContext: '.'
+        repository: '$(imageName)'
+        tags: 'cleanup'
+        arguments: '--target cleanup'
+    
+    - task: AzureCLI@2
+      displayName: 'Push Images to ACR'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Login to ACR
+          az acr login --name $(containerRegistryName)
+          
+          # Tag and push create image
+          docker tag $(imageName):create $(containerRegistryName).azurecr.io/$(imageName):create
+          docker push $(containerRegistryName).azurecr.io/$(imageName):create
+          
+          # Tag and push cleanup image
+          docker tag $(imageName):cleanup $(containerRegistryName).azurecr.io/$(imageName):cleanup
+          docker push $(containerRegistryName).azurecr.io/$(imageName):cleanup
+
+  - job: DeployContainers
+    displayName: 'Deploy Multiple Containers'
+    dependsOn: BuildImages
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Create Container Instances'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Get ACR credentials
+          ACR_USERNAME=$(az acr credential show --name $(containerRegistryName) --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name $(containerRegistryName) --query passwords[0].value -o tsv)
+          
+          # Deploy create container
+          az container create \
+            --resource-group $(resourceGroupName) \
+            --name myapp-create-1 \
+            --image $(containerRegistryName).azurecr.io/$(imageName):create \
+            --registry-username $ACR_USERNAME \
+            --registry-password $ACR_PASSWORD \
+            --cpu 1 --memory 1
+          
+          # Deploy cleanup container
+          az container create \
+            --resource-group $(resourceGroupName) \
+            --name myapp-cleanup-1 \
+            --image $(containerRegistryName).azurecr.io/$(imageName):cleanup \
+            --registry-username $ACR_USERNAME \
+            --registry-password $ACR_PASSWORD \
+            --cpu 1 --memory 1
+          
+          # Deploy multiple instances of create container
+          az container create \
+            --resource-group $(resourceGroupName) \
+            --name myapp-create-2 \
+            --image $(containerRegistryName).azurecr.io/$(imageName):create \
+            --registry-username $ACR_USERNAME \
+            --registry-password $ACR_PASSWORD \
+            --cpu 1 --memory 1
